@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Process Nemotron-Cascade-SFT-SWE into role-aligned training data."""
+"""Process Nemotron-Cascade-SFT-SWE into role-aligned training data.
+
+Uses the actual dataset schema: category column with values
+"SWE Localization", "SWE Repair", "SWE TestGen".
+"""
 
 import argparse
 import logging
 import sys
 
 from noe_train.data.nemotron_swe import (
+    CATEGORY_TO_ROLE,
     load_nemotron_swe,
-    process_localization,
-    process_repair,
-    process_test_generation,
+    process_category,
 )
 from noe_train.data.role_dataset import build_role_datasets, verify_counts
 from noe_train.utils.logging import setup_logging
@@ -34,23 +37,20 @@ def main():
         "debugger": [],
     }
 
-    # Process subsets based on available keys
-    for key, ds in subsets.items():
-        key_lower = key.lower()
-        if "local" in key_lower or "loc" in key_lower:
-            logger.info(f"Processing {key} → debugger ({len(ds)} samples)")
-            samples_by_role["debugger"].extend(process_localization(ds))
-        elif "repair" in key_lower or "fix" in key_lower or "patch" in key_lower:
-            logger.info(f"Processing {key} → coder ({len(ds)} samples)")
-            samples_by_role["coder"].extend(process_repair(ds))
-        elif "test" in key_lower or "gen" in key_lower:
-            logger.info(f"Processing {key} → tester ({len(ds)} samples)")
-            samples_by_role["tester"].extend(process_test_generation(ds))
-        else:
-            logger.warning(f"Unknown subset key: {key}, processing as debugger")
-            samples_by_role["debugger"].extend(process_localization(ds))
+    # Process each category subset
+    for category, ds in subsets.items():
+        role = CATEGORY_TO_ROLE.get(category)
+        if role is None:
+            logger.warning(f"Unknown category: {category}, skipping {len(ds)} rows")
+            continue
+
+        logger.info(f"Processing '{category}' → {role} ({len(ds)} samples)")
+        samples = process_category(ds, category)
+        samples_by_role[role].extend(samples)
+        logger.info(f"  Extracted {len(samples)} valid samples")
 
     # Report counts
+    logger.info("\nFinal counts:")
     for role, samples in samples_by_role.items():
         logger.info(f"  {role}: {len(samples)} samples")
 

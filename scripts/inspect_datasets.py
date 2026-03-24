@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Inspect Nemotron datasets: verify counts, schemas, and sample data.
 
-- Load nvidia/Nemotron-Cascade-SFT-SWE — verify ~92K/87K/32K split
+- Load nvidia/Nemotron-Cascade-SFT-SWE — verify category counts
 - Load nvidia/Nemotron-Cascade-RL-SWE — verify ~110K rows
-- Print column schemas, 5 example rows per subset
+- Print column schemas, sample rows, message structure
 """
 
-import json
 import logging
 import sys
 
@@ -34,22 +33,48 @@ def inspect_sft_swe():
     logger.info(f"Columns: {ds.column_names}")
     logger.info(f"Features: {ds.features}")
 
-    # Check for task_type column to identify subsets
-    if "task_type" in ds.column_names:
-        for task_type in ds.unique("task_type"):
-            subset = ds.filter(lambda x: x["task_type"] == task_type)
-            logger.info(f"  {task_type}: {len(subset)} rows")
+    # Check category column
+    if "category" in ds.column_names:
+        logger.info("\nCategory breakdown:")
+        for cat in sorted(ds.unique("category")):
+            subset = ds.filter(lambda x, c=cat: x["category"] == c)
+            logger.info(f"  {cat}: {len(subset)} rows")
     else:
-        logger.info("No 'task_type' column — inspecting raw structure")
+        logger.warning("No 'category' column found!")
 
-    # Print 5 sample rows
+    # Inspect message structure
+    if "messages" in ds.column_names:
+        logger.info("\nMessage structure (first row):")
+        messages = ds[0]["messages"]
+        for i, msg in enumerate(messages):
+            logger.info(f"  messages[{i}]: role={msg.get('role')}, "
+                       f"content_len={len(msg.get('content', ''))}")
+            content_preview = msg.get("content", "")[:200]
+            logger.info(f"    content preview: {content_preview}...")
+
+        # Check for <think> blocks
+        has_think = False
+        for msg in messages:
+            if "<think>" in msg.get("content", ""):
+                has_think = True
+                break
+        logger.info(f"\n  Contains <think> blocks: {has_think}")
+
+    # Print 3 sample rows (abbreviated)
     logger.info("\nSample rows:")
-    for i in range(min(5, len(ds))):
+    for i in range(min(3, len(ds))):
         row = ds[i]
         logger.info(f"\n--- Row {i} ---")
-        for key, value in row.items():
-            val_str = str(value)[:200]
-            logger.info(f"  {key}: {val_str}")
+        logger.info(f"  category: {row.get('category', 'N/A')}")
+        logger.info(f"  generator: {row.get('generator', 'N/A')}")
+        if "messages" in row:
+            for j, msg in enumerate(row["messages"]):
+                content = msg.get("content", "")
+                logger.info(f"  messages[{j}].role: {msg.get('role')}")
+                logger.info(f"  messages[{j}].content_len: {len(content)}")
+                logger.info(f"  messages[{j}].content[:150]: {content[:150]}")
+        if "thinking" in row and row["thinking"]:
+            logger.info(f"  thinking[:150]: {str(row['thinking'])[:150]}")
 
     return True
 
@@ -70,14 +95,34 @@ def inspect_rl_swe():
     logger.info(f"Columns: {ds.column_names}")
     logger.info(f"Features: {ds.features}")
 
-    # Print 5 sample rows
+    # Inspect relevant_file_contents structure
+    if "relevant_file_contents" in ds.column_names:
+        rfc = ds[0].get("relevant_file_contents", [])
+        logger.info(f"\nrelevant_file_contents structure:")
+        logger.info(f"  type: {type(rfc)}, length: {len(rfc) if isinstance(rfc, list) else 'N/A'}")
+        if isinstance(rfc, list) and len(rfc) > 0:
+            first = rfc[0]
+            logger.info(f"  first entry type: {type(first)}")
+            if isinstance(first, dict):
+                logger.info(f"  first entry keys: {list(first.keys())}")
+                for k, v in first.items():
+                    logger.info(f"    {k}: {str(v)[:100]}")
+
+    # Print 3 sample rows
     logger.info("\nSample rows:")
-    for i in range(min(5, len(ds))):
+    for i in range(min(3, len(ds))):
         row = ds[i]
         logger.info(f"\n--- Row {i} ---")
-        for key, value in row.items():
-            val_str = str(value)[:200]
-            logger.info(f"  {key}: {val_str}")
+        logger.info(f"  instance_id: {row.get('instance_id', 'N/A')}")
+        logger.info(f"  source: {row.get('source', 'N/A')}")
+        prompt = row.get("prompt", "")
+        logger.info(f"  prompt_len: {len(prompt)}")
+        logger.info(f"  prompt[:200]: {prompt[:200]}")
+        patch = row.get("golden_patch", "")
+        logger.info(f"  golden_patch_len: {len(patch)}")
+        logger.info(f"  golden_patch[:200]: {patch[:200]}")
+        rfc = row.get("relevant_file_contents", [])
+        logger.info(f"  relevant_file_contents: {len(rfc) if isinstance(rfc, list) else 'N/A'} files")
 
     return True
 

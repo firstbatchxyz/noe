@@ -1,17 +1,17 @@
 """Process Nemotron-Cascade-SFT-SWE into role-aligned format.
 
-Primary Stage A corpus:
-- ~92K localization samples → debugger + planner SFT
-- ~87K repair samples → coder SFT
-- ~32K test generation samples → tester SFT
+Actual schema (discovered Phase 0):
+- Columns: category, messages, generator, thinking
+- category: "SWE Localization" (92K), "SWE Repair" (87K), "SWE TestGen" (32K)
+- messages: [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
+- Assistant content contains <think>...</think> blocks (DeepSeek-R1) that we strip.
 """
 
 from __future__ import annotations
 
-import json
 import logging
+import re
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from datasets import Dataset, load_dataset
@@ -20,12 +20,27 @@ logger = logging.getLogger(__name__)
 
 DATASET_NAME = "nvidia/Nemotron-Cascade-SFT-SWE"
 
+# Category names as they appear in the dataset
+CATEGORY_LOCALIZATION = "SWE Localization"
+CATEGORY_REPAIR = "SWE Repair"
+CATEGORY_TESTGEN = "SWE TestGen"
+
+# Category → role mapping
+CATEGORY_TO_ROLE = {
+    CATEGORY_LOCALIZATION: "debugger",
+    CATEGORY_REPAIR: "coder",
+    CATEGORY_TESTGEN: "tester",
+}
+
 # Expected subset sizes (approximate)
 EXPECTED_COUNTS = {
-    "localization": 92_000,
-    "repair": 87_000,
-    "test_generation": 32_000,
+    CATEGORY_LOCALIZATION: 92_000,
+    CATEGORY_REPAIR: 87_000,
+    CATEGORY_TESTGEN: 32_000,
 }
+
+# Regex to strip <think>...</think> blocks from assistant output
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
 @dataclass()
@@ -37,136 +52,115 @@ class RoleSample:
     metadata: dict[str, Any]
 
 
+def strip_think_blocks(text: str) -> str:
+    """Remove <think>...</think> blocks from text."""
+    return _THINK_RE.sub("", text).strip()
+
+
 def load_nemotron_swe(
     split: str = "train",
     cache_dir: str | None = None,
 ) -> dict[str, Dataset]:
-    """Load and split Nemotron-Cascade-SFT-SWE by task type."""
+    """Load and split Nemotron-Cascade-SFT-SWE by category.
+
+    Returns: {category_name: dataset} mapping.
+    """
     logger.info(f"Loading {DATASET_NAME}...")
     ds = load_dataset(DATASET_NAME, split=split, cache_dir=cache_dir)
+    logger.info(f"Total rows: {len(ds)}")
+    logger.info(f"Columns: {ds.column_names}")
 
-    # Identify subsets by task_type column or similar
+    if "category" not in ds.column_names:
+        raise ValueError(
+            f"Expected 'category' column in {DATASET_NAME}, "
+            f"got: {ds.column_names}"
+        )
+
     subsets = {}
-    if "task_type" in ds.column_names:
-        for task_type in ds.unique("task_type"):
-            subsets[task_type] = ds.filter(lambda x: x["task_type"] == task_type)
-    else:
-        # If no explicit task_type, use heuristics on content
-        subsets["all"] = ds
+    for cat in ds.unique("category"):
+        subset = ds.filter(lambda x, c=cat: x["category"] == c)
+        subsets[cat] = subset
+        logger.info(f"  {cat}: {len(subset)} rows")
 
-    logger.info(f"Loaded subsets: {[(k, len(v)) for k, v in subsets.items()]}")
     return subsets
 
 
-def process_localization(ds: Dataset) -> list[dict[str, Any]]:
-    """Process localization samples for debugger SFT.
+def _extract_messages(row: dict[str, Any]) -> tuple[str, str]:
+    """Extract (user_content, assistant_content) from messages column.
 
-    Input: issue + repo context
-    Output: localized files + diagnosis
+    Messages format: [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
     """
-    samples = []
-    for row in ds:
-        input_text = _build_input(row, task="localization")
-        output_text = _extract_output(row, task="localization")
-        samples.append({
-            "role": "debugger",
-            "input_text": input_text,
-            "output_text": output_text,
-            "source": "nemotron_swe_localization",
-            "metadata": _extract_metadata(row),
-        })
-    return samples
+    messages = row.get("messages", [])
+    user_content = ""
+    assistant_content = ""
 
+    for msg in messages:
+        if msg["role"] == "user":
+            user_content = msg["content"]
+        elif msg["role"] == "assistant":
+            assistant_content = msg["content"]
 
-def process_repair(ds: Dataset) -> list[dict[str, Any]]:
-    """Process repair samples for coder SFT.
-
-    Input: issue + localized files + context
-    Output: patch
-    """
-    samples = []
-    for row in ds:
-        input_text = _build_input(row, task="repair")
-        output_text = _extract_output(row, task="repair")
-        samples.append({
-            "role": "coder",
-            "input_text": input_text,
-            "output_text": output_text,
-            "source": "nemotron_swe_repair",
-            "metadata": _extract_metadata(row),
-        })
-    return samples
-
-
-def process_test_generation(ds: Dataset) -> list[dict[str, Any]]:
-    """Process test generation samples for tester SFT.
-
-    Input: issue + patch
-    Output: test cases + expected results
-    """
-    samples = []
-    for row in ds:
-        input_text = _build_input(row, task="test_generation")
-        output_text = _extract_output(row, task="test_generation")
-        samples.append({
-            "role": "tester",
-            "input_text": input_text,
-            "output_text": output_text,
-            "source": "nemotron_swe_test_gen",
-            "metadata": _extract_metadata(row),
-        })
-    return samples
-
-
-def _build_input(row: dict[str, Any], task: str) -> str:
-    """Build input text from dataset row, adapted per task."""
-    parts = []
-
-    # Issue / problem statement
-    issue = row.get("problem_statement") or row.get("issue") or row.get("input", "")
-    if issue:
-        parts.append(f"## Issue\n{issue}")
-
-    # Repository context
-    repo = row.get("repo") or row.get("repository", "")
-    if repo:
-        parts.append(f"## Repository\n{repo}")
-
-    # File context (for repair/localization)
-    files = row.get("file_context") or row.get("relevant_files", "")
-    if files:
-        parts.append(f"## Relevant Files\n{files}")
-
-    # For repair: include localization
-    if task == "repair":
-        loc = row.get("localization") or row.get("localized_files", "")
-        if loc:
-            parts.append(f"## Localized Files\n{loc}")
-
-    # For test_generation: include patch
-    if task == "test_generation":
-        patch = row.get("patch") or row.get("gold_patch", "")
-        if patch:
-            parts.append(f"## Patch\n{patch}")
-
-    return "\n\n".join(parts)
-
-
-def _extract_output(row: dict[str, Any], task: str) -> str:
-    """Extract target output from dataset row."""
-    if task == "localization":
-        return row.get("output") or row.get("localization") or row.get("response", "")
-    elif task == "repair":
-        return row.get("output") or row.get("patch") or row.get("gold_patch", "")
-    elif task == "test_generation":
-        return row.get("output") or row.get("test_code") or row.get("response", "")
-    return row.get("output", "")
+    return user_content, assistant_content
 
 
 def _extract_metadata(row: dict[str, Any]) -> dict[str, Any]:
     """Extract metadata fields from a dataset row."""
     meta = {}
-    for key in ["instance_id", "repo", "base_commit", "version"]:
-        if key in row:
-            meta[key] = row[key]
+    if "generator" in row and row["generator"]:
+        meta["generator"] = row["generator"]
+    if "category" in row:
+        meta["category"] = row["category"]
     return meta
+
+
+def process_category(ds: Dataset, category: str) -> list[dict[str, Any]]:
+    """Process a category subset into role-aligned samples.
+
+    Extracts user message as input, assistant message (with think blocks stripped)
+    as output. Maps category to role via CATEGORY_TO_ROLE.
+    """
+    role = CATEGORY_TO_ROLE.get(category)
+    if role is None:
+        logger.warning(f"Unknown category: {category}, skipping")
+        return []
+
+    source_tag = f"nemotron_swe_{category.lower().replace(' ', '_')}"
+    samples = []
+
+    for row in ds:
+        user_content, assistant_content = _extract_messages(row)
+
+        if not user_content or not assistant_content:
+            continue
+
+        # Strip <think>...</think> blocks from assistant output
+        output_text = strip_think_blocks(assistant_content)
+        if not output_text:
+            continue
+
+        samples.append({
+            "role": role,
+            "input_text": user_content,
+            "output_text": output_text,
+            "source": source_tag,
+            "metadata": _extract_metadata(row),
+        })
+
+    return samples
+
+
+# Keep backward-compatible aliases that process_nemotron.py no longer needs,
+# but other code might reference.
+def process_localization(ds: Dataset) -> list[dict[str, Any]]:
+    """Process localization samples for debugger SFT."""
+    return process_category(ds, CATEGORY_LOCALIZATION)
+
+
+def process_repair(ds: Dataset) -> list[dict[str, Any]]:
+    """Process repair samples for coder SFT."""
+    return process_category(ds, CATEGORY_REPAIR)
+
+
+def process_test_generation(ds: Dataset) -> list[dict[str, Any]]:
+    """Process test generation samples for tester SFT."""
+    return process_category(ds, CATEGORY_TESTGEN)
