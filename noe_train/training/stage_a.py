@@ -64,7 +64,7 @@ def load_base_model(
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=cfg.model_name,
         max_seq_length=cfg.max_seq_len,
-        load_in_16bit=True,
+        load_in_4bit=False,
     )
 
     if tokenizer.pad_token is None:
