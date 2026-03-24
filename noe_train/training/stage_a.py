@@ -169,6 +169,12 @@ def train_role(
     # Apply LoRA — creates a new PeftModel wrapping the base
     lora_cfg = get_lora_config(role, rank_override=rank_override)
     model = get_peft_model(base_model, lora_cfg)
+
+    # Required for gradient checkpointing with PEFT — without this, the first
+    # layer's inputs don't have requires_grad=True, so autograd can't checkpoint.
+    if cfg.gradient_checkpointing:
+        model.enable_input_require_grads()
+
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     logger.info(f"  Trainable params: {trainable:,} / {total:,} ({trainable/total:.2%})")
