@@ -1,0 +1,28 @@
+encoder: microsoft/unixcoder-base
+hidden_dim: 768
+max_chunks: 64
+max_state_tokens: 512
+
+heads:
+  expert:
+    output_dim: 4
+    activation: sigmoid
+  stop:
+    output_dim: 1
+    activation: sigmoid
+  budget:
+    output_dim: 5
+    activation: softmax
+  chunk:
+    output_dim: 64
+    activation: sigmoid
+
+thresholds:
+  stop: 0.5
+  expert_select: 0.5
+  min_confidence: 0.3
+
+pretraining:
+  lr: 5e-5
+  epochs: 10
+  batch_size: 32

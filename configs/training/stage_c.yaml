@@ -1,0 +1,53 @@
+# Stage C: Team RL
+algorithm: grpo  # fallback: ppo
+
+grpo:
+  group_size: 6
+  clip_eps: 0.15
+
+ppo:
+  gamma: 0.995
+  gae_lambda: 0.95
+  clip_eps: 0.15
+
+unfreezing:
+  router_only_until: 5000
+  coder_at: 5000
+  debugger_at: 5000
+  tester_at: 15000  # only if test quality bottlenecks
+  # planner: stays frozen
+
+learning_rates:
+  critic: 2e-5
+  router: 1e-5
+  expert: 5e-6
+
+reward:
+  w_test_pass: 0.50
+  w_compile: 0.20
+  w_lint: 0.10
+  w_coverage: 0.10
+  w_verifier: 0.10
+  lambda_call: 0.02
+  lambda_round: 0.01
+  lambda_msg: 5e-5
+  terminal_bonus: 1.0
+  shared_fraction: 0.90
+  role_bonus_fraction: 0.10
+  cost_anneal_episodes: 20000
+
+training:
+  num_episodes: 30000
+  save_every: 1000
+  eval_every: 500
+  log_every: 50
+
+test_execution:
+  parallel_episodes: 32
+  llm_judge_fraction: 0.50
+  cache_enabled: true
+
+mopd:
+  enabled: true
+  distill_epochs: 1
+  roles: [coder, debugger]

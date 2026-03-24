@@ -1,0 +1,24 @@
+backbone:
+  model_name: Qwen/Qwen2.5-Coder-3B-Instruct
+  dtype: bfloat16
+  max_seq_len: 4096
+  trust_remote_code: true
+
+teacher:
+  model_name: Qwen/Qwen2.5-Coder-32B-Instruct
+
+episode:
+  max_rounds: 5
+  max_repairs: 2
+  step_timeout: 60
+  episode_timeout: 300
+
+sandbox:
+  memory_limit: "4g"
+  cpu_count: 2
+  network_mode: none
+  parallel_episodes: 32
+
+logging:
+  level: INFO
+  project: noe-train

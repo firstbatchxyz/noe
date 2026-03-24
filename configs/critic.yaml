@@ -1,0 +1,14 @@
+encoder: microsoft/unixcoder-base
+hidden_dim: 768
+max_state_tokens: 512
+
+value_head:
+  hidden_dims: [384, 192]
+  activation: gelu
+  dropout: 0.1
+
+training:
+  lr: 2e-5
+  epochs: 5
+  batch_size: 32
+  loss: mse

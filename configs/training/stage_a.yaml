@@ -1,0 +1,32 @@
+# Stage A: Individual Role SFT
+optimizer:
+  name: adamw_torch
+  lr: 2e-4
+  beta1: 0.9
+  beta2: 0.95
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  warmup_steps: 100
+
+training:
+  per_device_batch_size: 8
+  max_seq_len: 4096
+  num_epochs: 3
+  bf16: true
+  logging_steps: 50
+  save_steps: 500
+  eval_steps: 500
+  early_stopping_patience: 3
+  report_to: wandb
+
+gpu_assignments:
+  planner: 0
+  coder: 1
+  tester: 2
+  debugger: 3
+
+gate:
+  schema_validity: 0.98
+  execution_validity: 0.95

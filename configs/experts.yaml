@@ -1,0 +1,33 @@
+lora:
+  alpha: 64
+  dropout: 0.05
+  bias: none
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+roles:
+  planner:
+    rank: 32
+    default_budget: B2
+  coder:
+    rank: 16
+    default_budget: B4
+  tester:
+    rank: 16
+    default_budget: B2
+  debugger:
+    rank: 32
+    default_budget: B2
+
+budget_classes:
+  B0: {input: 768, gen: 192, msg: 64, tools: 0}
+  B1: {input: 1536, gen: 384, msg: 96, tools: 1}
+  B2: {input: 3072, gen: 768, msg: 128, tools: 2}
+  B3: {input: 4608, gen: 1024, msg: 192, tools: 3}
+  B4: {input: 6144, gen: 2048, msg: 256, tools: 3}
