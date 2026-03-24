@@ -235,8 +235,9 @@ def train_role(
         max_seq_length=cfg.max_seq_len,
         report_to="wandb",
         run_name=f"stage_a_{role.value}",
+        group_by_length=True,  # batch similar-length sequences → less padding waste
         dataloader_pin_memory=True,
-        dataloader_num_workers=2,
+        dataloader_num_workers=4,
         remove_unused_columns=False,
     )
 
