@@ -39,8 +39,8 @@ MODEL_NAME = "Qwen/Qwen2.5-Coder-3B-Instruct"
 class StageAConfig:
     model_name: str = MODEL_NAME
     max_seq_len: int = 4096
-    per_device_batch_size: int = 8
-    gradient_accumulation_steps: int = 1
+    per_device_batch_size: int = 4
+    gradient_accumulation_steps: int = 2  # effective batch = 4 * 2 = 8
     num_epochs: int = 3
     learning_rate: float = 2e-4
     warmup_steps: int = 100
