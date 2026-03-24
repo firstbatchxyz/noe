@@ -39,8 +39,8 @@ MODEL_NAME = "Qwen/Qwen2.5-Coder-3B-Instruct"
 class StageAConfig:
     model_name: str = MODEL_NAME
     max_seq_len: int = 4096
-    per_device_batch_size: int = 2
-    gradient_accumulation_steps: int = 4  # effective batch = 2 * 4 = 8
+    per_device_batch_size: int = 8
+    gradient_accumulation_steps: int = 1
     num_epochs: int = 3
     learning_rate: float = 2e-4
     warmup_steps: int = 100
@@ -219,7 +219,7 @@ def train_role(
         report_to="wandb",
         run_name=f"stage_a_{role.value}",
         dataloader_pin_memory=True,
-        dataloader_num_workers=4,
+        dataloader_num_workers=2,
         remove_unused_columns=False,
     )
 
