@@ -29,6 +29,7 @@ from transformers import (
 
 from noe_train.experts.lora_config import get_lora_config
 from noe_train.schema.messages import ExpertRole
+from noe_train.training.sdft import SDFTConfig, SDFTTrainer
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,10 @@ class StageAConfig:
     eval_steps: int = 500
     early_stopping_patience: int = 3
     gradient_checkpointing: bool = True
+    # SDFT (Self-Distillation Fine-Tuning)
+    sdft_enabled: bool = True
+    sdft_alpha: float = 0.5    # KL term weight (0=pure SFT, 1=equal weight)
+    sdft_temperature: float = 2.0  # distillation temperature
 
 
 def load_base_model(
@@ -223,7 +228,15 @@ def train_role(
         remove_unused_columns=False,
     )
 
-    trainer = Trainer(
+    # Use SDFTTrainer if enabled — adds KL divergence against base model
+    sdft_cfg = SDFTConfig(
+        enabled=cfg.sdft_enabled,
+        alpha=cfg.sdft_alpha,
+        temperature=cfg.sdft_temperature,
+    )
+    TrainerClass = SDFTTrainer if cfg.sdft_enabled else Trainer
+
+    trainer_kwargs = dict(
         model=model,
         args=training_args,
         train_dataset=train_tokenized,
@@ -231,6 +244,10 @@ def train_role(
         tokenizer=tokenizer,
         data_collator=data_collator,
     )
+    if cfg.sdft_enabled:
+        trainer_kwargs["sdft_config"] = sdft_cfg
+
+    trainer = TrainerClass(**trainer_kwargs)
 
     trainer.train()
 
