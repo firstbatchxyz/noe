@@ -61,12 +61,16 @@ def load_base_model(
     cfg = config or StageAConfig()
 
     logger.info(f"Loading base model via Unsloth: {cfg.model_name}")
-    model, tokenizer = FastLanguageModel.from_pretrained(
+    model, _processor = FastLanguageModel.from_pretrained(
         model_name=cfg.model_name,
         max_seq_length=cfg.max_seq_len,
         load_in_4bit=False,
     )
 
+    # Unsloth returns a VLM processor for Qwen3.5 which tries to parse text
+    # as image URLs. Load the text-only tokenizer separately.
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
