@@ -34,6 +34,7 @@ class ExpertOutput:
     input_tokens: int
     gen_tokens: int
     confidence: float
+    latent_vector: Any = None  # torch.Tensor (latent_dim,) or None
 
 
 class BaseExpert(ABC):
@@ -45,6 +46,7 @@ class BaseExpert(ABC):
         model: Any,
         tokenizer: Any,
         device: Any = "cuda",
+        latent_channel: Any = None,  # LatentChannel or None
     ):
         import torch
 
@@ -52,6 +54,7 @@ class BaseExpert(ABC):
         self.model = model
         self.tokenizer = tokenizer
         self.device = torch.device(device) if isinstance(device, str) else device
+        self.latent_channel = latent_channel  # None until Stage C
 
     @abstractmethod
     def build_prompt(
@@ -75,8 +78,14 @@ class BaseExpert(ABC):
         budget: BudgetClass,
         temperature: float = 0.6,
         top_p: float = 0.95,
+        incoming_latent: Any = None,  # torch.Tensor or None — from previous expert
     ) -> ExpertOutput:
-        """Generate output within budget constraints."""
+        """Generate output within budget constraints.
+
+        If latent_channel is attached and incoming_latent is provided, the latent
+        vector is injected as virtual tokens prepended to the input. After generation,
+        the expert's hidden states are projected to an outgoing latent vector.
+        """
         import torch
 
         inputs = self.tokenizer(
@@ -89,15 +98,33 @@ class BaseExpert(ABC):
         input_tokens = inputs["input_ids"].shape[1]
         tracker = BudgetTracker(budget, input_tokens_used=input_tokens)
 
+        # Inject incoming latent as virtual tokens (if channel is active)
+        if self.latent_channel is not None and incoming_latent is not None:
+            input_embeds = self.model.get_input_embeddings()(inputs["input_ids"])
+            latent = incoming_latent.unsqueeze(0).to(self.device) if incoming_latent.dim() == 1 else incoming_latent.to(self.device)
+            input_embeds, attn_mask = self.latent_channel.receive(
+                latent, input_embeds, inputs.get("attention_mask"),
+            )
+            # Generate from embeddings instead of input_ids
+            gen_kwargs = dict(
+                inputs_embeds=input_embeds,
+                attention_mask=attn_mask,
+            )
+        else:
+            gen_kwargs = dict(**inputs)
+
+        output_hidden = self.latent_channel is not None
+
         with torch.inference_mode():
             outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=min(budget.max_gen_tokens, budget.max_gen_tokens),
+                **gen_kwargs,
+                max_new_tokens=budget.max_gen_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 do_sample=True,
                 return_dict_in_generate=True,
                 output_scores=True,
+                output_hidden_states=output_hidden,
             )
 
         generated_ids = outputs.sequences[0, input_tokens:]
@@ -107,7 +134,14 @@ class BaseExpert(ABC):
         tracker.gen_tokens_used = gen_tokens
         confidence = self._estimate_confidence(outputs.scores)
 
+        # Project hidden states → outgoing latent vector
+        latent_vector = None
+        if output_hidden and hasattr(outputs, "hidden_states") and outputs.hidden_states:
+            latent_vector = self._extract_latent(outputs.hidden_states)
+
         artifact, message = self.parse_output(raw_text)
+        message.latent_vector = latent_vector
+
         return ExpertOutput(
             artifact=artifact,
             message=message,
@@ -115,6 +149,7 @@ class BaseExpert(ABC):
             input_tokens=input_tokens,
             gen_tokens=gen_tokens,
             confidence=confidence,
+            latent_vector=latent_vector,
         )
 
     def _estimate_confidence(self, scores: tuple) -> float:
@@ -133,6 +168,34 @@ class BaseExpert(ABC):
         # Normalize: assume max entropy ~10 (vocab ~150K)
         confidence = max(0.0, min(1.0, 1.0 - mean_entropy / 10.0))
         return confidence
+
+    def _extract_latent(self, hidden_states: tuple) -> Any:
+        """Extract latent vector from generation hidden states.
+
+        hidden_states is a tuple over generation steps. Each step is a tuple
+        over layers. We take the last layer's hidden state at each step,
+        stack them, and project via the latent channel.
+        """
+        import torch
+
+        if not self.latent_channel:
+            return None
+
+        # Collect last-layer hidden state from each generation step
+        # hidden_states[step][layer] = (batch, 1, hidden_dim)
+        last_layer_states = []
+        for step_hidden in hidden_states:
+            if step_hidden:  # tuple of layer tensors
+                last_layer_states.append(step_hidden[-1])  # last layer, (batch, 1, hidden_dim)
+
+        if not last_layer_states:
+            return None
+
+        # Stack: (batch, gen_steps, hidden_dim)
+        stacked = torch.cat(last_layer_states, dim=1)
+        # Project to latent
+        latent = self.latent_channel.project(stacked)  # (batch, latent_dim)
+        return latent.squeeze(0)  # (latent_dim,) for single-batch inference
 
     def _truncate_chunks(self, chunks: list[Chunk], max_tokens: int) -> list[Chunk]:
         """Select chunks that fit within token budget."""

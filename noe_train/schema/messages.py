@@ -40,6 +40,7 @@ class TypedMessage:
     summary: str  # compact summary for state compiler (64-96 tokens)
     token_count: int = 0  # token count of full content
     artifact_ref: str | None = None  # SHA-256 ref in artifact store
+    latent_vector: Any = None  # torch.Tensor (latent_dim,) or None — latent comm channel
 
 
 @dataclass()
@@ -185,6 +186,23 @@ class MessageHistory:
 
     def last(self) -> TypedMessage | None:
         return self.messages[-1] if self.messages else None
+
+    def latent_vectors(self, sender: ExpertRole | None = None) -> list[Any]:
+        """Get all latent vectors, optionally filtered by sender."""
+        vectors = []
+        for m in self.messages:
+            if m.latent_vector is not None:
+                if sender is None or m.sender == sender:
+                    vectors.append(m.latent_vector)
+        return vectors
+
+    def latest_latent(self, sender: ExpertRole | None = None) -> Any:
+        """Get the most recent latent vector."""
+        for m in reversed(self.messages):
+            if m.latent_vector is not None:
+                if sender is None or m.sender == sender:
+                    return m.latent_vector
+        return None
 
     def summaries(self, max_tokens: int = 512) -> str:
         parts = []
