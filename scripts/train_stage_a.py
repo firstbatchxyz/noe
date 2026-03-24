@@ -18,6 +18,7 @@ Single GPU grouping (--groups 1):
 
 import argparse
 import logging
+import os
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -25,6 +26,15 @@ from noe_train.utils.logging import setup_logging
 
 setup_logging()
 logger = logging.getLogger(__name__)
+
+
+def _setup_wandb(project: str, entity: str | None = None):
+    """Set wandb env vars so HF Trainer picks them up in all subprocesses."""
+    os.environ["WANDB_PROJECT"] = project
+    if entity:
+        os.environ["WANDB_ENTITY"] = entity
+    os.environ["WANDB_LOG_MODEL"] = "false"
+    logger.info(f"wandb: project={project}, entity={entity or '(default)'}")
 
 # Group roles by dataset size so parallel groups finish around the same time.
 # Group 0 (heavy): coder (87K) + planner (5K) ≈ 92K samples
@@ -93,7 +103,16 @@ def main():
     )
 
     parser.add_argument("--gpu-offset", type=int, default=0, help="First GPU ID to use")
+    parser.add_argument("--wandb-project", type=str, default="noe-train", help="wandb project name")
+    parser.add_argument("--wandb-entity", type=str, default=None, help="wandb team/entity")
+    parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
     args = parser.parse_args()
+
+    if args.no_wandb:
+        os.environ["WANDB_DISABLED"] = "true"
+        logger.info("wandb disabled")
+    else:
+        _setup_wandb(args.wandb_project, args.wandb_entity)
 
     if args.sequential or (not args.groups and not args.parallel):
         # Default: sequential on single GPU
