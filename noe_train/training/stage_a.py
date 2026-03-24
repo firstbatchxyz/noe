@@ -3,11 +3,10 @@
 Per-role training with LoRA adapters:
 - AdamW (beta1=0.9, beta2=0.95), lr=2e-4, cosine, 100-step warmup
 - Batch 8, max seq len 4096, 3 epochs, early stopping
-- bf16
+- bf16, loss masked on input tokens (output-only supervision)
 
 Supports multi-role-per-GPU: load base model once, train roles sequentially
-with adapter swap, or train 2 roles concurrently via threading with separate
-PEFT models sharing the frozen base weights.
+with adapter reload between roles.
 """
 
 from __future__ import annotations
@@ -23,6 +22,7 @@ from peft import PeftModel, get_peft_model
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    DataCollatorForSeq2Seq,
     Trainer,
     TrainingArguments,
 )
@@ -76,6 +76,61 @@ def load_base_model(
     return model, tokenizer
 
 
+def _tokenize_sft(
+    dataset: Dataset,
+    tokenizer: AutoTokenizer,
+    max_seq_len: int,
+) -> Dataset:
+    """Tokenize dataset with proper input masking for SFT.
+
+    Loss is computed only on output tokens — input tokens get label=-100.
+    No padding during tokenization; DataCollatorForSeq2Seq handles per-batch padding.
+    """
+
+    def _tokenize_row(examples):
+        all_input_ids = []
+        all_labels = []
+        all_attention_mask = []
+
+        for inp, out in zip(examples["input_text"], examples["output_text"]):
+            # Tokenize prompt and response separately to find the boundary
+            prompt_text = f"{inp}\n\n"
+            response_text = f"{out}{tokenizer.eos_token}"
+
+            prompt_enc = tokenizer(prompt_text, add_special_tokens=True)
+            response_enc = tokenizer(response_text, add_special_tokens=False)
+
+            prompt_ids = prompt_enc["input_ids"]
+            response_ids = response_enc["input_ids"]
+
+            # Concatenate and truncate
+            input_ids = (prompt_ids + response_ids)[:max_seq_len]
+
+            # Labels: -100 for prompt, real ids for response
+            prompt_len = min(len(prompt_ids), max_seq_len)
+            response_len = len(input_ids) - prompt_len
+            labels = [-100] * prompt_len + response_ids[:response_len]
+
+            attention_mask = [1] * len(input_ids)
+
+            all_input_ids.append(input_ids)
+            all_labels.append(labels)
+            all_attention_mask.append(attention_mask)
+
+        return {
+            "input_ids": all_input_ids,
+            "labels": all_labels,
+            "attention_mask": all_attention_mask,
+        }
+
+    return dataset.map(
+        _tokenize_row,
+        batched=True,
+        remove_columns=dataset.column_names,
+        desc="Tokenizing",
+    )
+
+
 def train_role(
     role: ExpertRole,
     train_dataset: Dataset,
@@ -117,34 +172,19 @@ def train_role(
     total = sum(p.numel() for p in model.parameters())
     logger.info(f"  Trainable params: {trainable:,} / {total:,} ({trainable/total:.2%})")
 
-    # Tokenize dataset
-    def tokenize_fn(examples):
-        texts = []
-        for inp, out in zip(examples["input_text"], examples["output_text"]):
-            texts.append(f"{inp}\n\n{out}{tokenizer.eos_token}")
-        return tokenizer(
-            texts,
-            truncation=True,
-            max_length=cfg.max_seq_len,
-            padding="max_length",
-        )
-
-    train_tokenized = train_dataset.map(
-        tokenize_fn, batched=True, remove_columns=train_dataset.column_names
-    )
-
-    def add_labels(examples):
-        examples["labels"] = examples["input_ids"].copy()
-        return examples
-
-    train_tokenized = train_tokenized.map(add_labels, batched=True)
+    # Tokenize with input masking
+    train_tokenized = _tokenize_sft(train_dataset, tokenizer, cfg.max_seq_len)
 
     eval_tokenized = None
     if val_dataset is not None:
-        eval_tokenized = val_dataset.map(
-            tokenize_fn, batched=True, remove_columns=val_dataset.column_names
-        )
-        eval_tokenized = eval_tokenized.map(add_labels, batched=True)
+        eval_tokenized = _tokenize_sft(val_dataset, tokenizer, cfg.max_seq_len)
+
+    # Dynamic padding collator — pads to longest in batch, labels padded with -100
+    data_collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        padding=True,
+        pad_to_multiple_of=8,  # slight efficiency gain for tensor cores
+    )
 
     # Training arguments
     training_args = TrainingArguments(
@@ -170,6 +210,9 @@ def train_role(
         gradient_checkpointing=cfg.gradient_checkpointing,
         report_to="wandb",
         run_name=f"stage_a_{role.value}",
+        dataloader_pin_memory=True,
+        dataloader_num_workers=4,
+        remove_unused_columns=False,
     )
 
     trainer = Trainer(
@@ -178,6 +221,7 @@ def train_role(
         train_dataset=train_tokenized,
         eval_dataset=eval_tokenized,
         tokenizer=tokenizer,
+        data_collator=data_collator,
     )
 
     trainer.train()
@@ -198,8 +242,9 @@ def train_role_group(
 ) -> dict[ExpertRole, PeftModel]:
     """Train multiple roles sequentially, sharing one base model load.
 
-    This avoids reloading the 3B base model for each role (~6GB saved per swap,
-    ~2 min saved per role on model load).
+    Loads the base model once at the start. Between roles, the LoRA adapter
+    is properly unloaded and the base model is re-wrapped with the next
+    role's adapter config.
 
     Args:
         roles: roles to train in order
@@ -209,12 +254,23 @@ def train_role_group(
     """
     cfg = config or StageAConfig()
 
-    # Load base model once
-    base_model, tokenizer = load_base_model(cfg)
-
     results = {}
-    for role in roles:
+    base_model = None
+    tokenizer = None
+
+    for i, role in enumerate(roles):
         train_ds, val_ds = datasets[role.value]
+
+        if i == 0:
+            # First role: load fresh base model
+            base_model, tokenizer = load_base_model(cfg)
+        else:
+            # Subsequent roles: reload base model to get clean weights
+            # (get_peft_model modifies the model in-place, so we can't reuse it)
+            logger.info(f"Reloading base model for {role.value}...")
+            del base_model
+            torch.cuda.empty_cache()
+            base_model, tokenizer = load_base_model(cfg)
 
         # Train this role's adapter
         peft_model = train_role(
@@ -228,11 +284,9 @@ def train_role_group(
         )
         results[role] = peft_model
 
-        # Unload the LoRA adapter, keep the base model for next role
-        # merge_and_unload would bake LoRA into base — we don't want that
-        # Instead, delete the PeftModel wrapper and re-wrap for next role
+        # Clean up the PeftModel
         del peft_model
         torch.cuda.empty_cache()
-        logger.info(f"Freed {role.value} adapter, base model retained")
+        logger.info(f"Freed {role.value} adapter")
 
     return results
