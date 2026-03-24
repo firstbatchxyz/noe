@@ -39,7 +39,8 @@ MODEL_NAME = "Qwen/Qwen2.5-Coder-3B-Instruct"
 class StageAConfig:
     model_name: str = MODEL_NAME
     max_seq_len: int = 4096
-    per_device_batch_size: int = 8
+    per_device_batch_size: int = 2
+    gradient_accumulation_steps: int = 4  # effective batch = 2 * 4 = 8
     num_epochs: int = 3
     learning_rate: float = 2e-4
     warmup_steps: int = 100
@@ -49,7 +50,7 @@ class StageAConfig:
     save_steps: int = 500
     eval_steps: int = 500
     early_stopping_patience: int = 3
-    gradient_checkpointing: bool = False
+    gradient_checkpointing: bool = True
 
 
 def load_base_model(
@@ -192,6 +193,7 @@ def train_role(
         num_train_epochs=cfg.num_epochs,
         per_device_train_batch_size=cfg.per_device_batch_size,
         per_device_eval_batch_size=cfg.per_device_batch_size,
+        gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         learning_rate=cfg.learning_rate,
         warmup_steps=cfg.warmup_steps,
         weight_decay=cfg.weight_decay,
