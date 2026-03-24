@@ -23,7 +23,7 @@ import torch.nn as nn
 
 @dataclass
 class LatentConfig:
-    hidden_dim: int = 2048     # Qwen2.5-Coder-3B hidden size
+    hidden_dim: int = 2560     # Qwen3.5-4B hidden size
     latent_dim: int = 256      # bottleneck dimension
     num_virtual_tokens: int = 4  # prepended to receiver input
     gate_init: float = -5.0    # sigmoid(-5) ≈ 0.007, nearly closed

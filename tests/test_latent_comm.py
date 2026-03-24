@@ -114,10 +114,10 @@ def test_channel_repr(config):
 
 
 def test_default_config_params():
-    """Test with default config (Qwen2.5-Coder-3B dimensions)."""
+    """Test with default config (Qwen3.5-4B dimensions)."""
     config = LatentConfig()
     channel = LatentChannel(config)
-    # Projector: Linear(2048→256) + LN = 2048*256+256 + 256+256 ≈ 525K
-    # Receiver: Linear(256→8192) + LN + gate = 256*8192+8192 + 2048+2048 + 1 ≈ 2.1M
+    # Projector: Linear(2560→256) + LN = 2560*256+256 + 256+256 ≈ 656K
+    # Receiver: Linear(256→10240) + LN + gate = 256*10240+10240 + 2560+2560 + 1 ≈ 2.6M
     count = channel.param_count()
-    assert 2_000_000 < count < 3_000_000  # ~2.6M total
+    assert 2_500_000 < count < 4_000_000  # ~3.3M total

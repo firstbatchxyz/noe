@@ -1,9 +1,10 @@
-"""Stage A: Individual Role SFT on frozen Qwen2.5-Coder-3B-Instruct.
+"""Stage A: Individual Role SFT on frozen Qwen3.5-4B (DeltaNet hybrid).
 
 Per-role training with LoRA adapters:
 - AdamW (beta1=0.9, beta2=0.95), lr=2e-4, cosine, 100-step warmup
-- Batch 8, max seq len 4096, 3 epochs, early stopping
+- Batch 8, max seq len 8192, 1 epoch
 - bf16, loss masked on input tokens (output-only supervision)
+- DeltaNet layers use linear attention (O(n)), full attention layers use sdpa
 
 Supports multi-role-per-GPU: load base model once, train roles sequentially
 with adapter reload between roles.
@@ -33,16 +34,16 @@ from noe_train.training.sdft import SDFTConfig, SDFTTrainer
 
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = "Qwen/Qwen2.5-Coder-3B-Instruct"
+MODEL_NAME = "Qwen/Qwen3.5-4B"
 
 
 @dataclass
 class StageAConfig:
     model_name: str = MODEL_NAME
-    max_seq_len: int = 4096
+    max_seq_len: int = 8192
     per_device_batch_size: int = 2
     gradient_accumulation_steps: int = 4  # effective batch = 2 * 4 = 8
-    num_epochs: int = 3
+    num_epochs: int = 1
     learning_rate: float = 2e-4
     warmup_steps: int = 100
     weight_decay: float = 0.01
@@ -53,7 +54,7 @@ class StageAConfig:
     early_stopping_patience: int = 3
     gradient_checkpointing: bool = True
     # SDFT (Self-Distillation Fine-Tuning)
-    sdft_enabled: bool = True
+    sdft_enabled: bool = False
     sdft_alpha: float = 0.5    # KL term weight (0=pure SFT, 1=equal weight)
     sdft_temperature: float = 2.0  # distillation temperature
 
@@ -69,15 +70,32 @@ def load_base_model(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg.model_name,
-        torch_dtype=torch.bfloat16 if cfg.bf16 else torch.float32,
-        trust_remote_code=True,
-    )
+    # Qwen3.5 is a VLM — AutoModelForCausalLM may load the full VLM or just
+    # the language model depending on transformers version. Either way, text-only
+    # training works (just don't pass pixel_values). Use sdpa for attention —
+    # FA2 has CUDA errors on DeltaNet layers.
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            cfg.model_name,
+            torch_dtype=torch.bfloat16 if cfg.bf16 else torch.float32,
+            attn_implementation="sdpa",
+            trust_remote_code=True,
+        )
+    except (ValueError, KeyError):
+        # Fallback: load as VLM, works for text-only training
+        from transformers import AutoModel
+        logger.info("AutoModelForCausalLM failed, loading as AutoModel (VLM wrapper)")
+        model = AutoModel.from_pretrained(
+            cfg.model_name,
+            torch_dtype=torch.bfloat16 if cfg.bf16 else torch.float32,
+            attn_implementation="sdpa",
+            trust_remote_code=True,
+        )
 
     params_b = sum(p.numel() for p in model.parameters()) / 1e9
     mem_gb = params_b * (2 if cfg.bf16 else 4)
     logger.info(f"  Base model: {params_b:.2f}B params, ~{mem_gb:.1f}GB VRAM")
+    logger.info(f"  Architecture: {type(model).__name__}")
 
     return model, tokenizer
 
@@ -109,13 +127,22 @@ def _tokenize_sft(
             prompt_ids = prompt_enc["input_ids"]
             response_ids = response_enc["input_ids"]
 
-            # Concatenate and truncate
-            input_ids = (prompt_ids + response_ids)[:max_seq_len]
+            # Always preserve the full output — truncate the input if needed.
+            # The output is the entire training signal (input is masked to -100).
+            max_prompt_len = max_seq_len - len(response_ids)
+            if max_prompt_len < 1:
+                # Output alone exceeds max_seq_len — truncate output (rare)
+                response_ids = response_ids[:max_seq_len - 1]
+                prompt_ids = prompt_ids[-1:]  # keep at least 1 token
+            elif max_prompt_len < len(prompt_ids):
+                # Truncate prompt from the left — keep the end (closest to output)
+                prompt_ids = prompt_ids[-max_prompt_len:]
+
+            input_ids = prompt_ids + response_ids
 
             # Labels: -100 for prompt, real ids for response
-            prompt_len = min(len(prompt_ids), max_seq_len)
-            response_len = len(input_ids) - prompt_len
-            labels = [-100] * prompt_len + response_ids[:response_len]
+            prompt_len = len(prompt_ids)
+            labels = [-100] * prompt_len + response_ids
 
             attention_mask = [1] * len(input_ids)
 

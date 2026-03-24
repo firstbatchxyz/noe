@@ -1,12 +1,27 @@
-"""LoRA configuration for expert adapters on Qwen2.5-Coder-3B-Instruct."""
+"""LoRA configuration for expert adapters.
+
+Supports both Qwen2.5 (standard transformer) and Qwen3.5 (DeltaNet hybrid).
+"""
 
 from __future__ import annotations
 
 from noe_train.schema.messages import ExpertRole
 
-# Standard transformer targets for Qwen2.5
+# Qwen3.5 DeltaNet hybrid targets:
+# - DeltaNet layers (24/32): in_proj_qkv, in_proj_z, in_proj_b, in_proj_a, out_proj
+# - Full attention layers (8/32): q_proj, k_proj, v_proj, o_proj
+# - MLP (all 32): gate_proj, up_proj, down_proj
+# NOT targeted: conv1d (nn.Conv1d), A_log, dt_bias (nn.Parameter — not nn.Linear)
 LORA_TARGET_MODULES = [
+    # DeltaNet (linear_attn) projections
+    "in_proj_qkv",
+    "in_proj_z",
+    "in_proj_b",
+    "in_proj_a",
+    "out_proj",
+    # Full attention (self_attn) projections
     "q_proj", "k_proj", "v_proj", "o_proj",
+    # MLP projections (all layers)
     "gate_proj", "up_proj", "down_proj",
 ]
 
