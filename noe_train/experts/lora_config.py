@@ -7,21 +7,17 @@ from __future__ import annotations
 
 from noe_train.schema.messages import ExpertRole
 
-# Qwen3.5 DeltaNet hybrid targets:
-# - DeltaNet layers (24/32): in_proj_qkv, in_proj_z, in_proj_b, in_proj_a, out_proj
+# Qwen3.5 DeltaNet hybrid — LoRA targets follow Unsloth's recommendation:
 # - Full attention layers (8/32): q_proj, k_proj, v_proj, o_proj
-# - MLP (all 32): gate_proj, up_proj, down_proj
-# NOT targeted: conv1d (nn.Conv1d), A_log, dt_bias (nn.Parameter — not nn.Linear)
+# - MLP (all 32 layers): gate_proj, up_proj, down_proj
+# DeltaNet projections (in_proj_qkv/z/b/a, out_proj) are NOT targeted —
+# DeltaNet layers have carefully tuned recurrence dynamics (A_log, dt_bias)
+# that LoRA on input projections can destabilize. MLP LoRA on all 32 layers
+# provides sufficient adaptation capacity.
 LORA_TARGET_MODULES = [
-    # DeltaNet (linear_attn) projections
-    "in_proj_qkv",
-    "in_proj_z",
-    "in_proj_b",
-    "in_proj_a",
-    "out_proj",
-    # Full attention (self_attn) projections
+    # Full attention (self_attn) projections — 8 layers
     "q_proj", "k_proj", "v_proj", "o_proj",
-    # MLP projections (all layers)
+    # MLP projections — all 32 layers
     "gate_proj", "up_proj", "down_proj",
 ]
 

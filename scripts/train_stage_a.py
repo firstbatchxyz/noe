@@ -54,11 +54,7 @@ def _worker_train_group(gpu_id: int, roles: list, data_dir: str, output_dir: str
         datasets[role_name] = (train_ds, val_ds)
         _logger.info(f"  {role_name}: {len(train_ds)} train, {len(val_ds)} val")
 
-    config = StageAConfig(
-        sdft_enabled=os.environ.get("NOE_SDFT_ENABLED", "1") == "1",
-        sdft_alpha=float(os.environ.get("NOE_SDFT_ALPHA", "0.5")),
-        sdft_temperature=float(os.environ.get("NOE_SDFT_TEMPERATURE", "2.0")),
-    )
+    config = StageAConfig()
     train_role_group(expert_roles, datasets, output_dir=output_dir, config=config)
     _logger.info(f"Worker done: GPU {gpu_id}, roles={roles}")
 
@@ -81,11 +77,7 @@ def _worker_train_single(gpu_id: int, role_name: str, data_dir: str, output_dir:
     role = ExpertRole(role_name)
     train_ds = load_role_dataset(data_dir, role_name, "train")
     val_ds = load_role_dataset(data_dir, role_name, "val")
-    config = StageAConfig(
-        sdft_enabled=os.environ.get("NOE_SDFT_ENABLED", "1") == "1",
-        sdft_alpha=float(os.environ.get("NOE_SDFT_ALPHA", "0.5")),
-        sdft_temperature=float(os.environ.get("NOE_SDFT_TEMPERATURE", "2.0")),
-    )
+    config = StageAConfig()
     train_role(role, train_ds, val_ds, output_dir=output_dir, config=config)
     _logger.info(f"Worker done: GPU {gpu_id}, role={role_name}")
 
@@ -95,7 +87,7 @@ def _collect_env_vars() -> dict:
     keys = [
         "WANDB_PROJECT", "WANDB_ENTITY", "WANDB_API_KEY", "WANDB_DISABLED",
         "WANDB_LOG_MODEL", "WANDB_MODE", "HF_HOME", "TRANSFORMERS_CACHE",
-        "HF_TOKEN", "NOE_SDFT_ENABLED", "NOE_SDFT_ALPHA", "NOE_SDFT_TEMPERATURE",
+        "HF_TOKEN",
     ]
     return {k: os.environ[k] for k in keys if k in os.environ}
 
@@ -133,9 +125,6 @@ def main():
     parser.add_argument("--wandb-project", type=str, default="noe-train", help="wandb project name")
     parser.add_argument("--wandb-entity", type=str, default=None, help="wandb team/entity")
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
-    parser.add_argument("--no-sdft", action="store_true", help="Disable SDFT (pure SFT)")
-    parser.add_argument("--sdft-alpha", type=float, default=0.5, help="SDFT KL weight")
-    parser.add_argument("--sdft-temperature", type=float, default=2.0, help="SDFT temperature")
     args = parser.parse_args()
 
     if args.no_wandb:
@@ -143,13 +132,6 @@ def main():
         logger.info("wandb disabled")
     else:
         _setup_wandb(args.wandb_project, args.wandb_entity)
-
-    # SDFT config via env vars (propagated to spawned workers)
-    os.environ["NOE_SDFT_ENABLED"] = "0" if args.no_sdft else "1"
-    os.environ["NOE_SDFT_ALPHA"] = str(args.sdft_alpha)
-    os.environ["NOE_SDFT_TEMPERATURE"] = str(args.sdft_temperature)
-    sdft_status = "disabled" if args.no_sdft else f"enabled (alpha={args.sdft_alpha}, T={args.sdft_temperature})"
-    logger.info(f"SDFT: {sdft_status}")
 
     # Use spawn context — each child gets a fresh Python with no inherited CUDA state
     ctx = mp.get_context("spawn")

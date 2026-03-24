@@ -1,10 +1,11 @@
 """Stage A: Individual Role SFT on frozen Qwen3.5-4B (DeltaNet hybrid).
 
+Uses Unsloth for optimized DeltaNet Triton kernels (1.5x faster, 50% less VRAM).
+
 Per-role training with LoRA adapters:
-- AdamW (beta1=0.9, beta2=0.95), lr=2e-4, cosine, 100-step warmup
+- AdamW-8bit, lr=2e-4, cosine, 100-step warmup
 - Batch 8, max seq len 8192, 1 epoch
 - bf16, loss masked on input tokens (output-only supervision)
-- DeltaNet layers use linear attention (O(n)), full attention layers use sdpa
 
 Supports multi-role-per-GPU: load base model once, train roles sequentially
 with adapter reload between roles.
@@ -15,22 +16,15 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import torch
 from datasets import Dataset
-from peft import PeftModel, get_peft_model
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    DataCollatorForSeq2Seq,
-    Trainer,
-    TrainingArguments,
-)
+from transformers import DataCollatorForSeq2Seq
+from unsloth import FastLanguageModel
+from trl import SFTTrainer, SFTConfig
 
-from noe_train.experts.lora_config import get_lora_config
+from noe_train.experts.lora_config import LORA_TARGET_MODULES, ROLE_RANKS
 from noe_train.schema.messages import ExpertRole
-from noe_train.training.sdft import SDFTConfig, SDFTTrainer
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +35,8 @@ MODEL_NAME = "Qwen/Qwen3.5-4B"
 class StageAConfig:
     model_name: str = MODEL_NAME
     max_seq_len: int = 8192
-    per_device_batch_size: int = 2
-    gradient_accumulation_steps: int = 4  # effective batch = 2 * 4 = 8
+    per_device_batch_size: int = 4
+    gradient_accumulation_steps: int = 2  # effective batch = 4 * 2 = 8
     num_epochs: int = 1
     learning_rate: float = 2e-4
     warmup_steps: int = 100
@@ -52,49 +46,32 @@ class StageAConfig:
     save_steps: int = 500
     eval_steps: int = 500
     early_stopping_patience: int = 3
-    gradient_checkpointing: bool = True
-    # SDFT (Self-Distillation Fine-Tuning)
-    sdft_enabled: bool = False
-    sdft_alpha: float = 0.5    # KL term weight (0=pure SFT, 1=equal weight)
-    sdft_temperature: float = 2.0  # distillation temperature
+    lora_alpha: int = 64
+    lora_dropout: float = 0.0  # Unsloth recommends 0 for LoRA
 
 
 def load_base_model(
     config: StageAConfig | None = None,
 ) -> tuple:
-    """Load the frozen base model + tokenizer once. Returns (model, tokenizer)."""
+    """Load the frozen base model + tokenizer via Unsloth.
+
+    Unsloth handles VLM → text model extraction, DeltaNet kernel patching,
+    and attention implementation selection automatically.
+    """
     cfg = config or StageAConfig()
 
-    logger.info(f"Loading base model: {cfg.model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, trust_remote_code=True)
+    logger.info(f"Loading base model via Unsloth: {cfg.model_name}")
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=cfg.model_name,
+        max_seq_length=cfg.max_seq_len,
+        load_in_16bit=True,
+    )
+
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Qwen3.5 is a VLM — AutoModelForCausalLM may load the full VLM or just
-    # the language model depending on transformers version. Either way, text-only
-    # training works (just don't pass pixel_values). Use sdpa for attention —
-    # FA2 has CUDA errors on DeltaNet layers.
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            cfg.model_name,
-            torch_dtype=torch.bfloat16 if cfg.bf16 else torch.float32,
-            attn_implementation="sdpa",
-            trust_remote_code=True,
-        )
-    except (ValueError, KeyError):
-        # Fallback: load as VLM, works for text-only training
-        from transformers import AutoModel
-        logger.info("AutoModelForCausalLM failed, loading as AutoModel (VLM wrapper)")
-        model = AutoModel.from_pretrained(
-            cfg.model_name,
-            torch_dtype=torch.bfloat16 if cfg.bf16 else torch.float32,
-            attn_implementation="sdpa",
-            trust_remote_code=True,
-        )
-
     params_b = sum(p.numel() for p in model.parameters()) / 1e9
-    mem_gb = params_b * (2 if cfg.bf16 else 4)
-    logger.info(f"  Base model: {params_b:.2f}B params, ~{mem_gb:.1f}GB VRAM")
+    logger.info(f"  Base model: {params_b:.2f}B params")
     logger.info(f"  Architecture: {type(model).__name__}")
 
     return model, tokenizer
@@ -102,12 +79,13 @@ def load_base_model(
 
 def _tokenize_sft(
     dataset: Dataset,
-    tokenizer: AutoTokenizer,
+    tokenizer,
     max_seq_len: int,
 ) -> Dataset:
     """Tokenize dataset with proper input masking for SFT.
 
     Loss is computed only on output tokens — input tokens get label=-100.
+    Output is always fully preserved; input is truncated from the left if needed.
     No padding during tokenization; DataCollatorForSeq2Seq handles per-batch padding.
     """
 
@@ -171,10 +149,10 @@ def train_role(
     output_dir: str | Path = "checkpoints/stage_a",
     config: StageAConfig | None = None,
     rank_override: int | None = None,
-    base_model: AutoModelForCausalLM | None = None,
-    tokenizer: AutoTokenizer | None = None,
-) -> PeftModel:
-    """Train a single role's LoRA adapter.
+    base_model=None,
+    tokenizer=None,
+):
+    """Train a single role's LoRA adapter via Unsloth.
 
     Args:
         role: which expert role to train
@@ -198,20 +176,23 @@ def train_role(
     if base_model is None or tokenizer is None:
         base_model, tokenizer = load_base_model(cfg)
 
-    # Apply LoRA — creates a new PeftModel wrapping the base
-    lora_cfg = get_lora_config(role, rank_override=rank_override)
-    model = get_peft_model(base_model, lora_cfg)
-
-    # Required for gradient checkpointing with PEFT — without this, the first
-    # layer's inputs don't have requires_grad=True, so autograd can't checkpoint.
-    if cfg.gradient_checkpointing:
-        model.enable_input_require_grads()
+    # Apply LoRA via Unsloth — handles gradient checkpointing + kernel patching
+    r = rank_override if rank_override is not None else ROLE_RANKS[role]
+    model = FastLanguageModel.get_peft_model(
+        base_model,
+        r=r,
+        target_modules=LORA_TARGET_MODULES,
+        lora_alpha=cfg.lora_alpha,
+        lora_dropout=cfg.lora_dropout,
+        bias="none",
+        use_gradient_checkpointing="unsloth",
+    )
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
-    logger.info(f"  Trainable params: {trainable:,} / {total:,} ({trainable/total:.2%})")
+    logger.info(f"  LoRA r={r}, trainable: {trainable:,} / {total:,} ({trainable/total:.2%})")
 
-    # Tokenize with input masking
+    # Tokenize with input masking (output-preserving truncation)
     train_tokenized = _tokenize_sft(train_dataset, tokenizer, cfg.max_seq_len)
 
     eval_tokenized = None
@@ -222,11 +203,11 @@ def train_role(
     data_collator = DataCollatorForSeq2Seq(
         tokenizer=tokenizer,
         padding=True,
-        pad_to_multiple_of=8,  # slight efficiency gain for tensor cores
+        pad_to_multiple_of=8,
     )
 
-    # Training arguments
-    training_args = TrainingArguments(
+    # Training config
+    training_args = SFTConfig(
         output_dir=str(role_output),
         num_train_epochs=cfg.num_epochs,
         per_device_train_batch_size=cfg.per_device_batch_size,
@@ -244,10 +225,10 @@ def train_role(
         load_best_model_at_end=eval_tokenized is not None,
         metric_for_best_model="eval_loss" if eval_tokenized else None,
         lr_scheduler_type="cosine",
-        optim="adamw_torch",
+        optim="adamw_8bit",
         adam_beta1=0.9,
         adam_beta2=0.95,
-        gradient_checkpointing=cfg.gradient_checkpointing,
+        max_seq_length=cfg.max_seq_len,
         report_to="wandb",
         run_name=f"stage_a_{role.value}",
         dataloader_pin_memory=True,
@@ -255,26 +236,14 @@ def train_role(
         remove_unused_columns=False,
     )
 
-    # Use SDFTTrainer if enabled — adds KL divergence against base model
-    sdft_cfg = SDFTConfig(
-        enabled=cfg.sdft_enabled,
-        alpha=cfg.sdft_alpha,
-        temperature=cfg.sdft_temperature,
-    )
-    TrainerClass = SDFTTrainer if cfg.sdft_enabled else Trainer
-
-    trainer_kwargs = dict(
+    trainer = SFTTrainer(
         model=model,
         args=training_args,
         train_dataset=train_tokenized,
         eval_dataset=eval_tokenized,
-        processing_class=tokenizer,
+        tokenizer=tokenizer,
         data_collator=data_collator,
     )
-    if cfg.sdft_enabled:
-        trainer_kwargs["sdft_config"] = sdft_cfg
-
-    trainer = TrainerClass(**trainer_kwargs)
 
     trainer.train()
 
@@ -291,7 +260,7 @@ def train_role_group(
     datasets: dict[str, tuple[Dataset, Dataset | None]],
     output_dir: str | Path = "checkpoints/stage_a",
     config: StageAConfig | None = None,
-) -> dict[ExpertRole, PeftModel]:
+) -> dict[ExpertRole, object]:
     """Train multiple roles sequentially, sharing one base model load.
 
     Loads the base model once at the start. Between roles, the LoRA adapter
@@ -314,17 +283,14 @@ def train_role_group(
         train_ds, val_ds = datasets[role.value]
 
         if i == 0:
-            # First role: load fresh base model
             base_model, tokenizer = load_base_model(cfg)
         else:
-            # Subsequent roles: reload base model to get clean weights
-            # (get_peft_model modifies the model in-place, so we can't reuse it)
+            # Reload base model — get_peft_model modifies in-place
             logger.info(f"Reloading base model for {role.value}...")
             del base_model
             torch.cuda.empty_cache()
             base_model, tokenizer = load_base_model(cfg)
 
-        # Train this role's adapter
         peft_model = train_role(
             role=role,
             train_dataset=train_ds,
@@ -336,7 +302,6 @@ def train_role_group(
         )
         results[role] = peft_model
 
-        # Clean up the PeftModel
         del peft_model
         torch.cuda.empty_cache()
         logger.info(f"Freed {role.value} adapter")
