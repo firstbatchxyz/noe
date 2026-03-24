@@ -198,6 +198,12 @@ def train_role(
 
     # Tokenize with input masking (output-preserving truncation)
     train_tokenized = _tokenize_sft(train_dataset, tokenizer, cfg.max_seq_len)
+    # Sort by length so similar-length sequences batch together → less padding waste.
+    # With DataCollatorForSeq2Seq padding to longest-in-batch, this avoids e.g.
+    # a 2K sequence padded to 8K because it landed in a batch with one long sample.
+    train_tokenized = train_tokenized.map(
+        lambda ex: {"_len": len(ex["input_ids"])},
+    ).sort("_len").remove_columns("_len")
 
     eval_tokenized = None
     if val_dataset is not None:
@@ -235,7 +241,6 @@ def train_role(
         max_seq_length=cfg.max_seq_len,
         report_to="wandb",
         run_name=f"stage_a_{role.value}",
-        group_by_length=True,  # batch similar-length sequences → less padding waste
         dataloader_pin_memory=True,
         dataloader_num_workers=4,
         remove_unused_columns=False,
