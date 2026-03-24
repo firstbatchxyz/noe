@@ -9,52 +9,42 @@ Modes:
 Single GPU timing estimates (A100 80GB):
   sequential: ~60h (planner 2h + coder 20h + tester 8h + debugger 20h + overhead)
   groups 2:   ~30h (group1: coder+planner on GPU0, group2: debugger+tester on GPU1)
-
-Single GPU grouping (--groups 1):
-  Loads base model once (~6GB), trains roles sequentially with LoRA swap.
-  Peak VRAM: ~18GB (model 6GB + LoRA 150MB + optimizer ~8GB + activations ~4GB).
-  Saves ~8 min of model reload time across 4 roles.
 """
 
 import argparse
 import logging
+import multiprocessing as mp
 import os
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from noe_train.utils.logging import setup_logging
 
 setup_logging()
 logger = logging.getLogger(__name__)
 
-
-def _setup_wandb(project: str, entity: str | None = None):
-    """Set wandb env vars so HF Trainer picks them up in all subprocesses."""
-    os.environ["WANDB_PROJECT"] = project
-    if entity:
-        os.environ["WANDB_ENTITY"] = entity
-    os.environ["WANDB_LOG_MODEL"] = "false"
-    logger.info(f"wandb: project={project}, entity={entity or '(default)'}")
-
 # Group roles by dataset size so parallel groups finish around the same time.
-# Group 0 (heavy): coder (87K) + planner (5K) ≈ 92K samples
-# Group 1 (heavy): debugger (92K) + tester (32K) ≈ 124K samples
-# Not perfectly balanced, but debugger r=32 trains slower per-sample than coder r=16,
-# so effective time is close.
 DEFAULT_GROUPS = [
     ["coder", "planner"],     # GPU 0: ~22h on A100
     ["debugger", "tester"],   # GPU 1: ~28h on A100
 ]
 
 
-def train_group(roles: list[str], data_dir: str, output_dir: str, gpu_id: int):
-    """Train a group of roles sequentially on one GPU, sharing the base model."""
-    import os
+def _worker_train_group(gpu_id: int, roles: list, data_dir: str, output_dir: str, env_vars: dict):
+    """Spawned subprocess entry point. Sets CUDA_VISIBLE_DEVICES BEFORE torch import."""
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    # Propagate wandb + other env vars from parent
+    for k, v in env_vars.items():
+        os.environ[k] = v
 
+    # Now safe to import torch — it will see only the assigned GPU
     from noe_train.data.role_dataset import load_role_dataset
     from noe_train.schema.messages import ExpertRole
     from noe_train.training.stage_a import StageAConfig, train_role_group
+    from noe_train.utils.logging import setup_logging as _setup
+
+    _setup()
+    _logger = logging.getLogger(f"stage_a.gpu{gpu_id}")
+    _logger.info(f"Worker started: GPU {gpu_id}, roles={roles}, CUDA_VISIBLE_DEVICES={gpu_id}")
 
     expert_roles = [ExpertRole(r) for r in roles]
     datasets = {}
@@ -62,24 +52,52 @@ def train_group(roles: list[str], data_dir: str, output_dir: str, gpu_id: int):
         train_ds = load_role_dataset(data_dir, role_name, "train")
         val_ds = load_role_dataset(data_dir, role_name, "val")
         datasets[role_name] = (train_ds, val_ds)
+        _logger.info(f"  {role_name}: {len(train_ds)} train, {len(val_ds)} val")
 
     config = StageAConfig()
     train_role_group(expert_roles, datasets, output_dir=output_dir, config=config)
+    _logger.info(f"Worker done: GPU {gpu_id}, roles={roles}")
 
 
-def train_single_role(role_name: str, data_dir: str, output_dir: str, gpu_id: int):
-    """Train one role on one GPU."""
-    import os
+def _worker_train_single(gpu_id: int, role_name: str, data_dir: str, output_dir: str, env_vars: dict):
+    """Spawned subprocess entry point for single role."""
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    for k, v in env_vars.items():
+        os.environ[k] = v
 
     from noe_train.data.role_dataset import load_role_dataset
     from noe_train.schema.messages import ExpertRole
     from noe_train.training.stage_a import StageAConfig, train_role
+    from noe_train.utils.logging import setup_logging as _setup
+
+    _setup()
+    _logger = logging.getLogger(f"stage_a.gpu{gpu_id}")
+    _logger.info(f"Worker started: GPU {gpu_id}, role={role_name}")
 
     role = ExpertRole(role_name)
     train_ds = load_role_dataset(data_dir, role_name, "train")
     val_ds = load_role_dataset(data_dir, role_name, "val")
     train_role(role, train_ds, val_ds, output_dir=output_dir, config=StageAConfig())
+    _logger.info(f"Worker done: GPU {gpu_id}, role={role_name}")
+
+
+def _collect_env_vars() -> dict:
+    """Collect env vars that need to propagate to spawned workers."""
+    keys = [
+        "WANDB_PROJECT", "WANDB_ENTITY", "WANDB_API_KEY", "WANDB_DISABLED",
+        "WANDB_LOG_MODEL", "WANDB_MODE", "HF_HOME", "TRANSFORMERS_CACHE",
+        "HF_TOKEN",
+    ]
+    return {k: os.environ[k] for k in keys if k in os.environ}
+
+
+def _setup_wandb(project: str, entity: str | None = None):
+    """Set wandb env vars so workers pick them up."""
+    os.environ["WANDB_PROJECT"] = project
+    if entity:
+        os.environ["WANDB_ENTITY"] = entity
+    os.environ["WANDB_LOG_MODEL"] = "false"
+    logger.info(f"wandb: project={project}, entity={entity or '(default)'}")
 
 
 def main():
@@ -114,23 +132,39 @@ def main():
     else:
         _setup_wandb(args.wandb_project, args.wandb_entity)
 
+    # Use spawn context — each child gets a fresh Python with no inherited CUDA state
+    ctx = mp.get_context("spawn")
+    env_vars = _collect_env_vars()
+
     if args.sequential or (not args.groups and not args.parallel):
-        # Default: sequential on single GPU
+        # Sequential: run in a spawned subprocess for clean CUDA isolation
         logger.info("Mode: sequential (single GPU, shared base model)")
         logger.info(f"  Roles: {args.roles}")
-        train_group(args.roles, args.data_dir, args.output_dir, args.gpu_offset)
+        p = ctx.Process(
+            target=_worker_train_group,
+            args=(args.gpu_offset, args.roles, args.data_dir, args.output_dir, env_vars),
+        )
+        p.start()
+        p.join()
+        if p.exitcode != 0:
+            logger.error(f"Sequential training failed (exit code {p.exitcode})")
+            return 1
 
     elif args.groups:
         n = args.groups
         if n == 1:
-            # Same as sequential
-            train_group(args.roles, args.data_dir, args.output_dir, args.gpu_offset)
+            p = ctx.Process(
+                target=_worker_train_group,
+                args=(args.gpu_offset, args.roles, args.data_dir, args.output_dir, env_vars),
+            )
+            p.start()
+            p.join()
+            if p.exitcode != 0:
+                return 1
         else:
-            # Split roles into N groups
             if n == 2:
                 groups = DEFAULT_GROUPS
             else:
-                # Round-robin assignment
                 groups = [[] for _ in range(n)]
                 for i, role in enumerate(args.roles):
                     groups[i % n].append(role)
@@ -139,43 +173,57 @@ def main():
             for i, g in enumerate(groups):
                 logger.info(f"  GPU {args.gpu_offset + i}: {g}")
 
-            with ProcessPoolExecutor(max_workers=n) as executor:
-                futures = {}
-                for i, group_roles in enumerate(groups):
-                    if not group_roles:
-                        continue
-                    gpu_id = args.gpu_offset + i
-                    future = executor.submit(
-                        train_group, group_roles, args.data_dir, args.output_dir, gpu_id
-                    )
-                    futures[future] = (i, group_roles)
+            # Launch one spawned process per group
+            processes = []
+            for i, group_roles in enumerate(groups):
+                if not group_roles:
+                    continue
+                gpu_id = args.gpu_offset + i
+                p = ctx.Process(
+                    target=_worker_train_group,
+                    args=(gpu_id, group_roles, args.data_dir, args.output_dir, env_vars),
+                )
+                p.start()
+                processes.append((p, i, group_roles))
+                logger.info(f"  Launched group {i} (pid={p.pid}) on GPU {gpu_id}: {group_roles}")
 
-                for future in as_completed(futures):
-                    idx, roles = futures[future]
-                    try:
-                        future.result()
-                        logger.info(f"Group {idx} completed: {roles}")
-                    except Exception as e:
-                        logger.error(f"Group {idx} failed ({roles}): {e}")
+            # Wait for all processes
+            failed = False
+            for p, idx, roles in processes:
+                p.join()
+                if p.exitcode == 0:
+                    logger.info(f"Group {idx} completed: {roles}")
+                else:
+                    logger.error(f"Group {idx} failed (exit code {p.exitcode}): {roles}")
+                    failed = True
+
+            if failed:
+                return 1
 
     elif args.parallel:
         logger.info("Mode: parallel (one role per GPU)")
-        with ProcessPoolExecutor(max_workers=len(args.roles)) as executor:
-            futures = {}
-            for i, role_name in enumerate(args.roles):
-                gpu_id = args.gpu_offset + i
-                future = executor.submit(
-                    train_single_role, role_name, args.data_dir, args.output_dir, gpu_id
-                )
-                futures[future] = role_name
+        processes = []
+        for i, role_name in enumerate(args.roles):
+            gpu_id = args.gpu_offset + i
+            p = ctx.Process(
+                target=_worker_train_single,
+                args=(gpu_id, role_name, args.data_dir, args.output_dir, env_vars),
+            )
+            p.start()
+            processes.append((p, role_name))
+            logger.info(f"  Launched {role_name} (pid={p.pid}) on GPU {gpu_id}")
 
-            for future in as_completed(futures):
-                role_name = futures[future]
-                try:
-                    future.result()
-                    logger.info(f"Completed: {role_name}")
-                except Exception as e:
-                    logger.error(f"Failed: {role_name}: {e}")
+        failed = False
+        for p, role_name in processes:
+            p.join()
+            if p.exitcode == 0:
+                logger.info(f"Completed: {role_name}")
+            else:
+                logger.error(f"Failed (exit code {p.exitcode}): {role_name}")
+                failed = True
+
+        if failed:
+            return 1
 
     logger.info("Stage A complete")
     return 0
