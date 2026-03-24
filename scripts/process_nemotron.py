@@ -10,7 +10,9 @@ import logging
 import sys
 
 from noe_train.data.nemotron_swe import (
+    CATEGORY_LOCALIZATION,
     CATEGORY_TO_ROLE,
+    derive_planner_from_localization,
     load_nemotron_swe,
     process_category,
 )
@@ -48,6 +50,17 @@ def main():
         samples = process_category(ds, category)
         samples_by_role[role].extend(samples)
         logger.info(f"  Extracted {len(samples)} valid samples")
+
+    # Derive planner data from localization subset
+    if CATEGORY_LOCALIZATION in subsets:
+        logger.info(f"\nDeriving planner data from localization samples...")
+        planner_samples = derive_planner_from_localization(
+            subsets[CATEGORY_LOCALIZATION],
+            max_samples=8000,
+        )
+        samples_by_role["planner"].extend(planner_samples)
+    else:
+        logger.warning("No localization subset found — cannot derive planner data")
 
     # Report counts
     logger.info("\nFinal counts:")

@@ -9,7 +9,9 @@ Actual schema (discovered Phase 0):
 
 from __future__ import annotations
 
+import json
 import logging
+import random
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -164,3 +166,111 @@ def process_repair(ds: Dataset) -> list[dict[str, Any]]:
 def process_test_generation(ds: Dataset) -> list[dict[str, Any]]:
     """Process test generation samples for tester SFT."""
     return process_category(ds, CATEGORY_TESTGEN)
+
+
+# ---------------------------------------------------------------------------
+# Planner derivation from localization data
+# ---------------------------------------------------------------------------
+
+# Regex to extract file paths (e.g. src/foo/bar.py, django/utils/text.py)
+_FILE_PATH_RE = re.compile(
+    r"(?:^|\s|`|'|\"|/)"  # preceded by whitespace, backtick, quote, or slash
+    r"((?:[a-zA-Z_][\w.-]*/)*"  # directory components
+    r"[a-zA-Z_][\w.-]*\.py)"  # filename.py
+    r"(?:\s|`|'|\"|:|,|$)",  # followed by delimiter
+    re.MULTILINE,
+)
+
+
+def _extract_file_paths(text: str) -> list[str]:
+    """Extract Python file paths mentioned in text."""
+    matches = _FILE_PATH_RE.findall(text)
+    # Deduplicate while preserving order
+    seen = set()
+    result = []
+    for m in matches:
+        if m not in seen and "/" in m:  # require at least one dir separator
+            seen.add(m)
+            result.append(m)
+    return result
+
+
+def _build_plan_json(files: list[str], strategy: str) -> str:
+    """Build a PLAN JSON string from extracted data."""
+    plan = {
+        "files_to_touch": files[:10],  # cap at 10 files
+        "invariants": ["existing tests must still pass"],
+        "risks": [],
+        "strategy": strategy,
+    }
+    return json.dumps(plan, indent=2)
+
+
+def derive_planner_from_localization(
+    localization_ds: Dataset,
+    max_samples: int = 8000,
+    seed: int = 42,
+    min_files: int = 1,
+) -> list[dict[str, Any]]:
+    """Derive planner training data from localization samples.
+
+    The localization output identifies relevant files + reasoning, which is
+    the core planner signal. We reformat into PLAN JSON schema.
+
+    Args:
+        localization_ds: the "SWE Localization" subset
+        max_samples: cap on derived samples
+        seed: random seed for sampling
+        min_files: minimum file paths that must be extractable
+    """
+    rng = random.Random(seed)
+
+    candidates = []
+    skipped = 0
+
+    for row in localization_ds:
+        user_content, assistant_content = _extract_messages(row)
+        if not user_content or not assistant_content:
+            skipped += 1
+            continue
+
+        # Strip think blocks to get the clean localization output
+        clean_output = strip_think_blocks(assistant_content)
+        if not clean_output:
+            skipped += 1
+            continue
+
+        # Extract file paths from the localization analysis
+        files = _extract_file_paths(clean_output)
+        if len(files) < min_files:
+            skipped += 1
+            continue
+
+        # Use first ~500 chars of clean output as strategy summary
+        # (the localization reasoning IS the strategy)
+        strategy_lines = clean_output.strip().split("\n")
+        strategy = " ".join(strategy_lines[:10])
+        if len(strategy) > 500:
+            strategy = strategy[:497] + "..."
+
+        plan_json = _build_plan_json(files, strategy)
+
+        candidates.append({
+            "role": "planner",
+            "input_text": user_content,
+            "output_text": plan_json,
+            "source": "derived_from_localization",
+            "metadata": _extract_metadata(row),
+        })
+
+    logger.info(
+        f"Planner derivation: {len(candidates)} candidates from "
+        f"{len(localization_ds)} localization samples ({skipped} skipped)"
+    )
+
+    # Sample down to max_samples
+    if len(candidates) > max_samples:
+        candidates = rng.sample(candidates, max_samples)
+        logger.info(f"  Sampled down to {max_samples}")
+
+    return candidates
