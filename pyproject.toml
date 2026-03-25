@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "noe-train"
 version = "0.1.0"
 description = "Network of Experts (NoE) — multi-expert SWE agent training"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     # Core
     "torch>=2.2",
@@ -47,6 +47,10 @@ dev = [
 
 [tool.setuptools.packages.find]
 include = ["noe_train*"]
+
+[tool.uv]
+index-url = "https://download.pytorch.org/whl/cu126"
+extra-index-url = ["https://pypi.org/simple"]
 
 [tool.ruff]
 line-length = 100
