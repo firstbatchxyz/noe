@@ -48,6 +48,7 @@ class StageAConfig:
     early_stopping_patience: int = 3
     lora_alpha: int = 64
     lora_dropout: float = 0.0  # Unsloth recommends 0 for LoRA
+    max_samples: int | None = None  # subsample training data (None = use all)
 
 
 def load_base_model(
@@ -173,6 +174,13 @@ def train_role(
     role_output.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"Stage A: Training {role.value} adapter")
+
+    # Subsample if max_samples is set
+    if cfg.max_samples and len(train_dataset) > cfg.max_samples:
+        original_len = len(train_dataset)
+        train_dataset = train_dataset.shuffle(seed=42).select(range(cfg.max_samples))
+        logger.info(f"  Subsampled: {cfg.max_samples} / {original_len} train samples")
+
     logger.info(f"  Train samples: {len(train_dataset)}")
     logger.info(f"  Output: {role_output}")
 

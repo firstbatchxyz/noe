@@ -29,7 +29,7 @@ DEFAULT_GROUPS = [
 ]
 
 
-def _worker_train_group(gpu_id: int, roles: list, data_dir: str, output_dir: str, env_vars: dict):
+def _worker_train_group(gpu_id: int, roles: list, data_dir: str, output_dir: str, env_vars: dict, max_samples: int | None = None):
     """Spawned subprocess entry point. Sets CUDA_VISIBLE_DEVICES BEFORE torch import."""
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     # Propagate wandb + other env vars from parent
@@ -54,12 +54,12 @@ def _worker_train_group(gpu_id: int, roles: list, data_dir: str, output_dir: str
         datasets[role_name] = (train_ds, val_ds)
         _logger.info(f"  {role_name}: {len(train_ds)} train, {len(val_ds)} val")
 
-    config = StageAConfig()
+    config = StageAConfig(max_samples=max_samples)
     train_role_group(expert_roles, datasets, output_dir=output_dir, config=config)
     _logger.info(f"Worker done: GPU {gpu_id}, roles={roles}")
 
 
-def _worker_train_single(gpu_id: int, role_name: str, data_dir: str, output_dir: str, env_vars: dict):
+def _worker_train_single(gpu_id: int, role_name: str, data_dir: str, output_dir: str, env_vars: dict, max_samples: int | None = None):
     """Spawned subprocess entry point for single role."""
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     for k, v in env_vars.items():
@@ -77,7 +77,7 @@ def _worker_train_single(gpu_id: int, role_name: str, data_dir: str, output_dir:
     role = ExpertRole(role_name)
     train_ds = load_role_dataset(data_dir, role_name, "train")
     val_ds = load_role_dataset(data_dir, role_name, "val")
-    config = StageAConfig()
+    config = StageAConfig(max_samples=max_samples)
     train_role(role, train_ds, val_ds, output_dir=output_dir, config=config)
     _logger.info(f"Worker done: GPU {gpu_id}, role={role_name}")
 
@@ -122,6 +122,7 @@ def main():
     )
 
     parser.add_argument("--gpu-offset", type=int, default=0, help="First GPU ID to use")
+    parser.add_argument("--max-samples", type=int, default=None, help="Subsample training data per role")
     parser.add_argument("--wandb-project", type=str, default="noe-train", help="wandb project name")
     parser.add_argument("--wandb-entity", type=str, default=None, help="wandb team/entity")
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
@@ -143,7 +144,7 @@ def main():
         logger.info(f"  Roles: {args.roles}")
         p = ctx.Process(
             target=_worker_train_group,
-            args=(args.gpu_offset, args.roles, args.data_dir, args.output_dir, env_vars),
+            args=(args.gpu_offset, args.roles, args.data_dir, args.output_dir, env_vars, args.max_samples),
         )
         p.start()
         p.join()
@@ -156,7 +157,7 @@ def main():
         if n == 1:
             p = ctx.Process(
                 target=_worker_train_group,
-                args=(args.gpu_offset, args.roles, args.data_dir, args.output_dir, env_vars),
+                args=(args.gpu_offset, args.roles, args.data_dir, args.output_dir, env_vars, args.max_samples),
             )
             p.start()
             p.join()
@@ -182,7 +183,7 @@ def main():
                 gpu_id = args.gpu_offset + i
                 p = ctx.Process(
                     target=_worker_train_group,
-                    args=(gpu_id, group_roles, args.data_dir, args.output_dir, env_vars),
+                    args=(gpu_id, group_roles, args.data_dir, args.output_dir, env_vars, args.max_samples),
                 )
                 p.start()
                 processes.append((p, i, group_roles))
@@ -208,7 +209,7 @@ def main():
             gpu_id = args.gpu_offset + i
             p = ctx.Process(
                 target=_worker_train_single,
-                args=(gpu_id, role_name, args.data_dir, args.output_dir, env_vars),
+                args=(gpu_id, role_name, args.data_dir, args.output_dir, env_vars, args.max_samples),
             )
             p.start()
             processes.append((p, role_name))
